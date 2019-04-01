@@ -103,36 +103,10 @@ struct _beep_parms_T
     beep_parms_T *next;  /* in case -n/--new is used. */
 };
 
-
-/* Global. Set to true by the signal handlers, read only by the main
- * thread. */
-static volatile sig_atomic_t global_abort = false;
-
-
-/* If we get interrupted, it would be nice to not leave the speaker
- * beeping in perpetuity.
- *
- * Everything called from this signal handler must be thread-safe,
- * signal-safe, reentrant including all API functions.  Otherwise, we
- * get another CVE-2018-0492.
- *
- * So we make certain we keep to using the following API calls:
- *
- *   * close(2):      safe
- *   * _exit(2):      safe (which exit(3) is NOT)
- *   * bzero(3):      MT-safe
- *   * memset(3):     MT-safe
- *   * write(2):      safe
- *   * strerror_r(3): MT-safe
- *   * strlen(3):     MT-safe
- */
-void handle_signal(int unused_signum);
-
-void handle_signal(int unused_signum __attribute__(( unused )))
+static void
+handle_signal(int unused_signum __attribute__(( unused )))
 {
-    global_abort = true;
 }
-
 
 /* print usage and leave exit code up to the caller */
 static
@@ -320,12 +294,16 @@ int sleep_ms(beep_driver *driver, unsigned int milliseconds)
     const struct timespec request =
         { seconds,
           nanoseconds };
+    signal(SIGINT,  handle_signal);
+    signal(SIGTERM, handle_signal);
     const int retcode = nanosleep(&request, NULL);
-    if (global_abort) {
+    if (retcode == -1 && errno == EINTR) {
         beep_drivers_end_tone(driver);
         beep_drivers_fini(driver);
         exit(EXIT_FAILURE);
     }
+    signal(SIGINT,  SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
     return retcode;
 }
 
@@ -339,7 +317,7 @@ void play_beep(beep_driver *driver, beep_parms_T parms)
                 parms.freq);
 
     /* repeat the beep */
-    for (unsigned int i = 0; (!global_abort) && (i < parms.reps); i++) {
+    for (unsigned int i = 0; i < parms.reps; i++) {
         beep_drivers_begin_tone(driver, parms.freq & 0xffff);
         sleep_ms(driver, parms.length);
         beep_drivers_end_tone(driver);
@@ -442,31 +420,10 @@ int main(const int argc, char *const argv[])
                 (void *)driver, driver->name,
                 driver->device_fd, driver->device_name);
 
-    /* At this time, we know what API to use on which device, and we do
-     * not have to fall back onto printing '\a' any more.
-     */
-
-    /* Memory barrier. All globals have been set up, so we make sure the
-     * values are actually written to memory.  Only then do we install
-     * the signal handlers.
-     *
-     * TBD: Use C11 atomic_signal_fence() instead of "__asm__ volatile"?
-     */
-    __asm__ volatile ("" : : : "memory");
-
-    /* After all the initialization has happened and the global
-     * variables used to communicate with the signal handlers have
-     * actually been set up properly, we can finally install the signal
-     * handlers. As we do not start making any noises, there is no need
-     * to install the signal handlers any earlier.
-     */
-    signal(SIGINT,  handle_signal);
-    signal(SIGTERM, handle_signal);
-
     /* this outermost while loop handles the possibility that -n/--new
        has been used, i.e. that we have multiple beeps specified. Each
        iteration will play, then free() one parms instance. */
-    while ((!global_abort) && parms) {
+    while (parms) {
         beep_parms_T *next = parms->next;
 
         if (parms->stdin_beep != STDIN_BEEP_NONE) {
@@ -483,9 +440,9 @@ int main(const int argc, char *const argv[])
             setvbuf(stdout, NULL, _IONBF, 0);
 
             char sin[4096];
-            while ((!global_abort) && (fgets(sin, 4096, stdin))) {
+            while (fgets(sin, 4096, stdin)) {
                 if (parms->stdin_beep == STDIN_BEEP_CHAR) {
-                    for (char *ptr=sin; (!global_abort) && (*ptr); ptr++) {
+                    for (char *ptr=sin; *ptr; ptr++) {
                         putchar(*ptr);
                         fflush(stdout);
                         play_beep(driver, *parms);
@@ -507,11 +464,7 @@ int main(const int argc, char *const argv[])
     beep_drivers_end_tone(driver);
     beep_drivers_fini(driver);
 
-    if (global_abort) {
-        return EXIT_FAILURE;
-    } else {
-        return EXIT_SUCCESS;
-    }
+    return EXIT_SUCCESS;
 }
 
 
